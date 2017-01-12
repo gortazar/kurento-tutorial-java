@@ -20,6 +20,8 @@ package org.kurento.tutorial.helloworld;
 import java.io.IOException;
 import java.util.concurrent.ConcurrentHashMap;
 
+import org.kurento.client.AudioCaps;
+import org.kurento.client.AudioCodec;
 import org.kurento.client.EventListener;
 import org.kurento.client.IceCandidate;
 import org.kurento.client.IceCandidateFoundEvent;
@@ -96,6 +98,7 @@ public class HelloWorldHandler extends TextWebSocketHandler {
       MediaPipeline pipeline = kurento.createMediaPipeline();
       WebRtcEndpoint webRtcEndpoint = new WebRtcEndpoint.Builder(pipeline).build();
       webRtcEndpoint.connect(webRtcEndpoint);
+//      webRtcEndpoint.setAudioFormat(new AudioCaps(AudioCodec.RAW, 6000));
 
       // 2. Store user session
       UserSession user = new UserSession();

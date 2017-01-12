@@ -15,8 +15,18 @@
  */
 package org.kurento.tutorial.helloworld;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
+import org.kurento.client.AudioCaps;
+import org.kurento.client.AudioCodec;
 import org.kurento.client.EndOfStreamEvent;
 import org.kurento.client.ErrorEvent;
 import org.kurento.client.EventListener;
@@ -36,14 +46,29 @@ import org.kurento.jsonrpc.JsonUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
+import com.google.auth.oauth2.GoogleCredentials;
+import com.google.cloud.speech.v1beta1.RecognitionConfig;
+import com.google.cloud.speech.v1beta1.RecognitionConfig.AudioEncoding;
+import com.google.cloud.speech.v1beta1.SpeechGrpc;
+import com.google.cloud.speech.v1beta1.StreamingRecognitionConfig;
+import com.google.cloud.speech.v1beta1.StreamingRecognizeRequest;
+import com.google.cloud.speech.v1beta1.StreamingRecognizeResponse;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
+import com.google.protobuf.ByteString;
+import com.google.protobuf.TextFormat;
+
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.auth.ClientAuthInterceptor;
+import io.grpc.stub.StreamObserver;
 
 /**
  * Hello World with recording handler (application and media logic).
@@ -56,305 +81,421 @@ import com.google.gson.JsonObject;
  */
 public class HelloWorldRecHandler extends TextWebSocketHandler {
 
-  private static final String RECORDER_FILE_PATH = "file:///tmp/HelloWorldRecorded.webm";
+	private static final int SAMPLE_RATE = 16000;
+	private static final String RECORDER_FILE_PATH = "file:///opt/recorder/HelloWorldRecorded.webm";
+	private static final String LOCAL_RECORDER_FILE_PATH = "/home/patxi/tmp/HelloWorldRecorded.webm";
+	private static final int BYTES_PER_BUFFER = 3200; // buffer size in bytes
+	private static final int BYTES_PER_SAMPLE = 2; // bytes per sample for
+													// LINEAR16
+	private static final List<String> OAUTH2_SCOPES = Arrays.asList("https://www.googleapis.com/auth/cloud-platform");
 
-  private final Logger log = LoggerFactory.getLogger(HelloWorldRecHandler.class);
-  private static final Gson gson = new GsonBuilder().create();
+	private final Logger log = LoggerFactory.getLogger(HelloWorldRecHandler.class);
+	private static final Gson gson = new GsonBuilder().create();
 
-  @Autowired
-  private UserRegistry registry;
+	@Autowired
+	private UserRegistry registry;
 
-  @Autowired
-  private KurentoClient kurento;
+	@Autowired
+	private KurentoClient kurento;
+	private ManagedChannel channel;
+	private volatile boolean inProgess;
 
-  @Override
-  public void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
-    JsonObject jsonMessage = gson.fromJson(message.getPayload(), JsonObject.class);
+	@Override
+	public void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
+		JsonObject jsonMessage = gson.fromJson(message.getPayload(), JsonObject.class);
 
-    log.debug("Incoming message: {}", jsonMessage);
+		log.debug("Incoming message: {}", jsonMessage);
 
-    UserSession user = registry.getBySession(session);
-    if (user != null) {
-      log.debug("Incoming message from user '{}': {}", user.getId(), jsonMessage);
-    } else {
-      log.debug("Incoming message from new user: {}", jsonMessage);
-    }
+		UserSession user = registry.getBySession(session);
+		if (user != null) {
+			log.debug("Incoming message from user '{}': {}", user.getId(), jsonMessage);
+		} else {
+			log.debug("Incoming message from new user: {}", jsonMessage);
+		}
 
-    switch (jsonMessage.get("id").getAsString()) {
-      case "start":
-        start(session, jsonMessage);
-        break;
-      case "stop":
-        if (user != null) {
-          user.stop();
-        }
-      case "stopPlay":
-        if (user != null) {
-          user.release();
-        }
-        break;
-      case "play":
-        play(user, session, jsonMessage);
-        break;
-      case "onIceCandidate": {
-        JsonObject jsonCandidate = jsonMessage.get("candidate").getAsJsonObject();
+		switch (jsonMessage.get("id").getAsString()) {
+		case "start":
+			start(session, jsonMessage);
+			break;
+		case "stop":
+			if (user != null) {
+				channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+				user.stop();
+			}
+		case "stopPlay":
+			if (user != null) {
+				inProgess = false;
+				user.release();
+			}
+			break;
+		case "play":
+			play(user, session, jsonMessage);
+			break;
+		case "onIceCandidate": {
+			JsonObject jsonCandidate = jsonMessage.get("candidate").getAsJsonObject();
 
-        if (user != null) {
-          IceCandidate candidate = new IceCandidate(jsonCandidate.get("candidate").getAsString(),
-              jsonCandidate.get("sdpMid").getAsString(),
-              jsonCandidate.get("sdpMLineIndex").getAsInt());
-          user.addCandidate(candidate);
-        }
-        break;
-      }
-      default:
-        sendError(session, "Invalid message with id " + jsonMessage.get("id").getAsString());
-        break;
-    }
-  }
+			if (user != null) {
+				IceCandidate candidate = new IceCandidate(jsonCandidate.get("candidate").getAsString(),
+						jsonCandidate.get("sdpMid").getAsString(), jsonCandidate.get("sdpMLineIndex").getAsInt());
+				user.addCandidate(candidate);
+			}
+			break;
+		}
+		default:
+			sendError(session, "Invalid message with id " + jsonMessage.get("id").getAsString());
+			break;
+		}
+	}
 
-  @Override
-  public void afterConnectionClosed(WebSocketSession session, CloseStatus status) throws Exception {
-    super.afterConnectionClosed(session, status);
-    registry.removeBySession(session);
-  }
+	@Override
+	public void afterConnectionClosed(WebSocketSession session, CloseStatus status) throws Exception {
+		super.afterConnectionClosed(session, status);
+		registry.removeBySession(session);
+	}
 
-  private void start(final WebSocketSession session, JsonObject jsonMessage) {
-    try {
+	private void start(final WebSocketSession session, JsonObject jsonMessage) {
+		try {
 
-      // 1. Media logic (webRtcEndpoint in loopback)
-      MediaPipeline pipeline = kurento.createMediaPipeline();
-      WebRtcEndpoint webRtcEndpoint = new WebRtcEndpoint.Builder(pipeline).build();
-      webRtcEndpoint.connect(webRtcEndpoint);
+			// 1. Media logic (webRtcEndpoint in loopback)
+			MediaPipeline pipeline = kurento.createMediaPipeline();
+			WebRtcEndpoint webRtcEndpoint = new WebRtcEndpoint.Builder(pipeline).build();
+			webRtcEndpoint.connect(webRtcEndpoint);
 
-      MediaProfileSpecType profile = getMediaProfileFromMessage(jsonMessage);
+			MediaProfileSpecType profile = getMediaProfileFromMessage(jsonMessage);
 
-      RecorderEndpoint recorder = new RecorderEndpoint.Builder(pipeline, RECORDER_FILE_PATH)
-      .withMediaProfile(profile).build();
+			RecorderEndpoint recorder = new RecorderEndpoint.Builder(pipeline, RECORDER_FILE_PATH)
+					.withMediaProfile(MediaProfileSpecType.WEBM_AUDIO_ONLY).build();
+			recorder.setAudioFormat(new AudioCaps(AudioCodec.RAW, 16000));
 
-      recorder.addRecordingListener(new EventListener<RecordingEvent>() {
+			recorder.addRecordingListener(new EventListener<RecordingEvent>() {
 
-        @Override
-        public void onEvent(RecordingEvent event) {
-          JsonObject response = new JsonObject();
-          response.addProperty("id", "recording");
-          try {
-            synchronized (session) {
-              session.sendMessage(new TextMessage(response.toString()));
-            }
-          } catch (IOException e) {
-            log.error(e.getMessage());
-          }
-        }
+				@Override
+				public void onEvent(RecordingEvent event) {
+					JsonObject response = new JsonObject();
+					response.addProperty("id", "recording");
+					try {
+						synchronized (session) {
+							session.sendMessage(new TextMessage(response.toString()));
+						}
+					} catch (IOException e) {
+						log.error(e.getMessage());
+					}
+				}
 
-      });
+			});
 
-      recorder.addStoppedListener(new EventListener<StoppedEvent>() {
+			recorder.addStoppedListener(new EventListener<StoppedEvent>() {
 
-        @Override
-        public void onEvent(StoppedEvent event) {
-          JsonObject response = new JsonObject();
-          response.addProperty("id", "stopped");
-          try {
-            synchronized (session) {
-              session.sendMessage(new TextMessage(response.toString()));
-            }
-          } catch (IOException e) {
-            log.error(e.getMessage());
-          }
-        }
+				@Override
+				public void onEvent(StoppedEvent event) {
+					JsonObject response = new JsonObject();
+					response.addProperty("id", "stopped");
+					try {
+						synchronized (session) {
+							session.sendMessage(new TextMessage(response.toString()));
+						}
+					} catch (IOException e) {
+						log.error(e.getMessage());
+					}
+				}
 
-      });
+			});
 
-      recorder.addPausedListener(new EventListener<PausedEvent>() {
+			recorder.addPausedListener(new EventListener<PausedEvent>() {
 
-        @Override
-        public void onEvent(PausedEvent event) {
-          JsonObject response = new JsonObject();
-          response.addProperty("id", "paused");
-          try {
-            synchronized (session) {
-              session.sendMessage(new TextMessage(response.toString()));
-            }
-          } catch (IOException e) {
-            log.error(e.getMessage());
-          }
-        }
+				@Override
+				public void onEvent(PausedEvent event) {
+					JsonObject response = new JsonObject();
+					response.addProperty("id", "paused");
+					try {
+						synchronized (session) {
+							session.sendMessage(new TextMessage(response.toString()));
+						}
+					} catch (IOException e) {
+						log.error(e.getMessage());
+					}
+				}
 
-      });
+			});
 
-      connectAccordingToProfile(webRtcEndpoint, recorder, profile);
+			connectAccordingToProfile(webRtcEndpoint, recorder, profile);
 
-      // 2. Store user session
-      UserSession user = new UserSession(session);
-      user.setMediaPipeline(pipeline);
-      user.setWebRtcEndpoint(webRtcEndpoint);
-      user.setRecorderEndpoint(recorder);
-      registry.register(user);
+			// 2. Store user session
+			UserSession user = new UserSession(session);
+			user.setMediaPipeline(pipeline);
+			user.setWebRtcEndpoint(webRtcEndpoint);
+			user.setRecorderEndpoint(recorder);
+			registry.register(user);
 
-      // 3. SDP negotiation
-      String sdpOffer = jsonMessage.get("sdpOffer").getAsString();
-      String sdpAnswer = webRtcEndpoint.processOffer(sdpOffer);
+			// 3. SDP negotiation
+			String sdpOffer = jsonMessage.get("sdpOffer").getAsString();
+			String sdpAnswer = webRtcEndpoint.processOffer(sdpOffer);
 
-      // 4. Gather ICE candidates
-      webRtcEndpoint.addIceCandidateFoundListener(new EventListener<IceCandidateFoundEvent>() {
+			// 4. Gather ICE candidates
+			webRtcEndpoint.addIceCandidateFoundListener(new EventListener<IceCandidateFoundEvent>() {
 
-        @Override
-        public void onEvent(IceCandidateFoundEvent event) {
-          JsonObject response = new JsonObject();
-          response.addProperty("id", "iceCandidate");
-          response.add("candidate", JsonUtils.toJsonObject(event.getCandidate()));
-          try {
-            synchronized (session) {
-              session.sendMessage(new TextMessage(response.toString()));
-            }
-          } catch (IOException e) {
-            log.error(e.getMessage());
-          }
-        }
-      });
+				@Override
+				public void onEvent(IceCandidateFoundEvent event) {
+					JsonObject response = new JsonObject();
+					response.addProperty("id", "iceCandidate");
+					response.add("candidate", JsonUtils.toJsonObject(event.getCandidate()));
+					try {
+						synchronized (session) {
+							session.sendMessage(new TextMessage(response.toString()));
+						}
+					} catch (IOException e) {
+						log.error(e.getMessage());
+					}
+				}
+			});
 
-      JsonObject response = new JsonObject();
-      response.addProperty("id", "startResponse");
-      response.addProperty("sdpAnswer", sdpAnswer);
+			JsonObject response = new JsonObject();
+			response.addProperty("id", "startResponse");
+			response.addProperty("sdpAnswer", sdpAnswer);
 
-      synchronized (user) {
-        session.sendMessage(new TextMessage(response.toString()));
-      }
+			synchronized (user) {
+				session.sendMessage(new TextMessage(response.toString()));
+			}
 
-      webRtcEndpoint.gatherCandidates();
+			webRtcEndpoint.gatherCandidates();
 
-      recorder.record();
-    } catch (Throwable t) {
-      log.error("Start error", t);
-      sendError(session, t.getMessage());
-    }
-  }
+			recorder.record();
+			inProgess = true;
 
-  private MediaProfileSpecType getMediaProfileFromMessage(JsonObject jsonMessage) {
+			speechToTextStart();
 
-    MediaProfileSpecType profile;
-    switch (jsonMessage.get("mode").getAsString()) {
-      case "audio-only":
-        profile = MediaProfileSpecType.WEBM_AUDIO_ONLY;
-        break;
-      case "video-only":
-        profile = MediaProfileSpecType.WEBM_VIDEO_ONLY;
-        break;
-      default:
-        profile = MediaProfileSpecType.WEBM;
-    }
+		} catch (Throwable t) {
+			log.error("Start error", t);
+			sendError(session, t.getMessage());
+		}
+	}
 
-    return profile;
-  }
+	@Async
+	private void speechToTextStart() throws InterruptedException {
 
-  private void connectAccordingToProfile(WebRtcEndpoint webRtcEndpoint, RecorderEndpoint recorder,
-      MediaProfileSpecType profile) {
-    switch (profile) {
-      case WEBM:
-        webRtcEndpoint.connect(recorder, MediaType.AUDIO);
-        webRtcEndpoint.connect(recorder, MediaType.VIDEO);
-        break;
-      case WEBM_AUDIO_ONLY:
-        webRtcEndpoint.connect(recorder, MediaType.AUDIO);
-        break;
-      case WEBM_VIDEO_ONLY:
-        webRtcEndpoint.connect(recorder, MediaType.VIDEO);
-        break;
-      default:
-        throw new UnsupportedOperationException("Unsupported profile for this tutorial: " + profile);
-    }
-  }
+		try {
+			channel = createChannel("speech.googleapis.com", 443);
+		} catch (Exception e) {
+			log.error("Failed to create channel", e);
+		}
 
-  private void play(UserSession user, final WebSocketSession session, JsonObject jsonMessage) {
-    try {
+		SpeechGrpc.SpeechStub speechClient = SpeechGrpc.newStub(channel);
 
-      // 1. Media logic
-      final MediaPipeline pipeline = kurento.createMediaPipeline();
-      WebRtcEndpoint webRtcEndpoint = new WebRtcEndpoint.Builder(pipeline).build();
-      PlayerEndpoint player = new PlayerEndpoint.Builder(pipeline, RECORDER_FILE_PATH).build();
-      player.connect(webRtcEndpoint);
+		final CountDownLatch finishLatch = new CountDownLatch(1);
+		StreamObserver<StreamingRecognizeResponse> responseObserver = new StreamObserver<StreamingRecognizeResponse>() {
+			@Override
+			public void onNext(StreamingRecognizeResponse response) {
+				log.info("Received response: " + TextFormat.printToString(response));
+			}
 
-      // Player listeners
-      player.addErrorListener(new EventListener<ErrorEvent>() {
-        @Override
-        public void onEvent(ErrorEvent event) {
-          log.info("ErrorEvent for session '{}': {}", session.getId(), event.getDescription());
-          sendPlayEnd(session, pipeline);
-        }
-      });
-      player.addEndOfStreamListener(new EventListener<EndOfStreamEvent>() {
-        @Override
-        public void onEvent(EndOfStreamEvent event) {
-          log.info("EndOfStreamEvent for session '{}'", session.getId());
-          sendPlayEnd(session, pipeline);
-        }
-      });
+			@Override
+			public void onError(Throwable error) {
+				log.warn("recognize failed: {0}", error);
+				finishLatch.countDown();
+			}
 
-      // 2. Store user session
-      user.setMediaPipeline(pipeline);
-      user.setWebRtcEndpoint(webRtcEndpoint);
+			@Override
+			public void onCompleted() {
+				log.info("recognize completed.");
+				finishLatch.countDown();
+			}
+		};
 
-      // 3. SDP negotiation
-      String sdpOffer = jsonMessage.get("sdpOffer").getAsString();
-      String sdpAnswer = webRtcEndpoint.processOffer(sdpOffer);
+		StreamObserver<StreamingRecognizeRequest> requestObserver;
+		try {
+			requestObserver = speechClient.streamingRecognize(responseObserver);
+		} catch(Exception e) {
+			log.error("Speech client:couldn't configure streaming recognize with response observer");
+			throw e;
+		}
+		
+		try {
+			// Build and send a StreamingRecognizeRequest containing the
+			// parameters for
+			// processing the audio.
+			RecognitionConfig config = RecognitionConfig.newBuilder().setEncoding(AudioEncoding.LINEAR16)
+					.setSampleRate(SAMPLE_RATE).build();
+			StreamingRecognitionConfig streamingConfig = StreamingRecognitionConfig.newBuilder().setConfig(config)
+					.setInterimResults(true).setSingleUtterance(true).build();
 
-      JsonObject response = new JsonObject();
-      response.addProperty("id", "playResponse");
-      response.addProperty("sdpAnswer", sdpAnswer);
+			StreamingRecognizeRequest initial = StreamingRecognizeRequest.newBuilder()
+					.setStreamingConfig(streamingConfig).build();
+			requestObserver.onNext(initial);
 
-      // 4. Gather ICE candidates
-      webRtcEndpoint.addIceCandidateFoundListener(new EventListener<IceCandidateFoundEvent>() {
+			// Open audio file. Read and send sequential buffers of audio as
+			// additional RecognizeRequests.
 
-        @Override
-        public void onEvent(IceCandidateFoundEvent event) {
-          JsonObject response = new JsonObject();
-          response.addProperty("id", "iceCandidate");
-          response.add("candidate", JsonUtils.toJsonObject(event.getCandidate()));
-          try {
-            synchronized (session) {
-              session.sendMessage(new TextMessage(response.toString()));
-            }
-          } catch (IOException e) {
-            log.error(e.getMessage());
-          }
-        }
-      });
+			try (FileInputStream in = new FileInputStream(new File(LOCAL_RECORDER_FILE_PATH))) {
+				// For LINEAR16 at 16000 Hz sample rate, 3200 bytes corresponds
+				// to 100 milliseconds of audio.
+				byte[] buffer = new byte[BYTES_PER_BUFFER];
+				int bytesRead;
+				int totalBytes = 0;
+				int samplesPerBuffer = BYTES_PER_BUFFER / BYTES_PER_SAMPLE;
+				int samplesPerMillis = 16_000 / 1000;
 
-      // 5. Play recorded stream
-      player.play();
+				while (inProgess) {
+					while ((bytesRead = in.read(buffer)) != -1) {
+						totalBytes += bytesRead;
+						StreamingRecognizeRequest request = StreamingRecognizeRequest.newBuilder()
+								.setAudioContent(ByteString.copyFrom(buffer, 0, bytesRead)).build();
+						requestObserver.onNext(request);
+					}
+				}
+				log.info("Sent " + totalBytes + " bytes from audio file: " + LOCAL_RECORDER_FILE_PATH);
 
-      synchronized (session) {
-        session.sendMessage(new TextMessage(response.toString()));
-      }
+			} catch (FileNotFoundException e) {
+				log.error("File not found: " + e.getMessage());
+			} catch (IOException e) {
+				log.error("Error reading file: " + e.getMessage());
+			}
+		} catch (RuntimeException e) {
+			// Cancel RPC.
+			log.error("Runtime error: " + e.getMessage()); 
+			requestObserver.onError(e);
+			throw e;
+		}
+		// Mark the end of requests.
+		requestObserver.onCompleted();
 
-      webRtcEndpoint.gatherCandidates();
-    } catch (Throwable t) {
-      log.error("Play error", t);
-      sendError(session, t.getMessage());
-    }
-  }
+		// Receiving happens asynchronously.
+		finishLatch.await(1, TimeUnit.MINUTES);
+	}
 
-  public void sendPlayEnd(WebSocketSession session, MediaPipeline pipeline) {
-    try {
-      JsonObject response = new JsonObject();
-      response.addProperty("id", "playEnd");
-      session.sendMessage(new TextMessage(response.toString()));
-    } catch (IOException e) {
-      log.error("Error sending playEndOfStream message", e);
-    }
-    // Release pipeline
-    pipeline.release();
-  }
+	private ManagedChannel createChannel(String host, int port) throws IOException {
+		GoogleCredentials creds = GoogleCredentials.getApplicationDefault();
+		creds = creds.createScoped(OAUTH2_SCOPES);
+		ManagedChannel channel = ManagedChannelBuilder.forAddress(host, port)
+				.intercept(new ClientAuthInterceptor(creds, Executors.newSingleThreadExecutor())).build();
 
-  private void sendError(WebSocketSession session, String message) {
-    try {
-      JsonObject response = new JsonObject();
-      response.addProperty("id", "error");
-      response.addProperty("message", message);
-      session.sendMessage(new TextMessage(response.toString()));
-    } catch (IOException e) {
-      log.error("Exception sending message", e);
-    }
-  }
+		return channel;
+	}
+
+	private MediaProfileSpecType getMediaProfileFromMessage(JsonObject jsonMessage) {
+
+		// MediaProfileSpecType profile;
+		// switch (jsonMessage.get("mode").getAsString()) {
+		// case "audio-only":
+		// profile = MediaProfileSpecType.WEBM_AUDIO_ONLY;
+		// break;
+		// case "video-only":
+		// profile = MediaProfileSpecType.WEBM_VIDEO_ONLY;
+		// break;
+		// default:
+		// profile = MediaProfileSpecType.WEBM;
+		// }
+		//
+		// return profile;
+		return MediaProfileSpecType.WEBM_AUDIO_ONLY;
+	}
+
+	private void connectAccordingToProfile(WebRtcEndpoint webRtcEndpoint, RecorderEndpoint recorder,
+			MediaProfileSpecType profile) {
+		switch (profile) {
+		case WEBM:
+			webRtcEndpoint.connect(recorder, MediaType.AUDIO);
+			webRtcEndpoint.connect(recorder, MediaType.VIDEO);
+			break;
+		case WEBM_AUDIO_ONLY:
+			webRtcEndpoint.connect(recorder, MediaType.AUDIO);
+			break;
+		case WEBM_VIDEO_ONLY:
+			webRtcEndpoint.connect(recorder, MediaType.VIDEO);
+			break;
+		default:
+			throw new UnsupportedOperationException("Unsupported profile for this tutorial: " + profile);
+		}
+	}
+
+	private void play(UserSession user, final WebSocketSession session, JsonObject jsonMessage) {
+		try {
+
+			// 1. Media logic
+			final MediaPipeline pipeline = kurento.createMediaPipeline();
+			WebRtcEndpoint webRtcEndpoint = new WebRtcEndpoint.Builder(pipeline).build();
+			PlayerEndpoint player = new PlayerEndpoint.Builder(pipeline, RECORDER_FILE_PATH).build();
+			player.connect(webRtcEndpoint);
+
+			// Player listeners
+			player.addErrorListener(new EventListener<ErrorEvent>() {
+				@Override
+				public void onEvent(ErrorEvent event) {
+					log.info("ErrorEvent for session '{}': {}", session.getId(), event.getDescription());
+					sendPlayEnd(session, pipeline);
+				}
+			});
+			player.addEndOfStreamListener(new EventListener<EndOfStreamEvent>() {
+				@Override
+				public void onEvent(EndOfStreamEvent event) {
+					log.info("EndOfStreamEvent for session '{}'", session.getId());
+					sendPlayEnd(session, pipeline);
+				}
+			});
+
+			// 2. Store user session
+			user.setMediaPipeline(pipeline);
+			user.setWebRtcEndpoint(webRtcEndpoint);
+
+			// 3. SDP negotiation
+			String sdpOffer = jsonMessage.get("sdpOffer").getAsString();
+			String sdpAnswer = webRtcEndpoint.processOffer(sdpOffer);
+
+			JsonObject response = new JsonObject();
+			response.addProperty("id", "playResponse");
+			response.addProperty("sdpAnswer", sdpAnswer);
+
+			// 4. Gather ICE candidates
+			webRtcEndpoint.addIceCandidateFoundListener(new EventListener<IceCandidateFoundEvent>() {
+
+				@Override
+				public void onEvent(IceCandidateFoundEvent event) {
+					JsonObject response = new JsonObject();
+					response.addProperty("id", "iceCandidate");
+					response.add("candidate", JsonUtils.toJsonObject(event.getCandidate()));
+					try {
+						synchronized (session) {
+							session.sendMessage(new TextMessage(response.toString()));
+						}
+					} catch (IOException e) {
+						log.error(e.getMessage());
+					}
+				}
+			});
+
+			// 5. Play recorded stream
+			player.play();
+
+			synchronized (session) {
+				session.sendMessage(new TextMessage(response.toString()));
+			}
+
+			webRtcEndpoint.gatherCandidates();
+		} catch (Throwable t) {
+			log.error("Play error", t);
+			sendError(session, t.getMessage());
+		}
+	}
+
+	public void sendPlayEnd(WebSocketSession session, MediaPipeline pipeline) {
+		try {
+			JsonObject response = new JsonObject();
+			response.addProperty("id", "playEnd");
+			session.sendMessage(new TextMessage(response.toString()));
+		} catch (IOException e) {
+			log.error("Error sending playEndOfStream message", e);
+		}
+		// Release pipeline
+		pipeline.release();
+	}
+
+	private void sendError(WebSocketSession session, String message) {
+		try {
+			JsonObject response = new JsonObject();
+			response.addProperty("id", "error");
+			response.addProperty("message", message);
+			session.sendMessage(new TextMessage(response.toString()));
+		} catch (IOException e) {
+			log.error("Exception sending message", e);
+		}
+	}
 }

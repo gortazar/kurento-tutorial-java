@@ -45,15 +45,33 @@
 
 	<properties>
 		<demo.port>8087</demo.port>
-
+		<tcnative.classifier>linux-x86_64</tcnative.classifier>
+		<codehaus-versions-maven-plugin-version>2.3</codehaus-versions-maven-plugin-version>
+		<grpc-protobuf-version>1.0.2</grpc-protobuf-version>
+		<maven-compiler-plugin-version>3.6.0</maven-compiler-plugin-version>
+		<xolstice-protobuf-maven-plugin-version>0.5.0</xolstice-protobuf-maven-plugin-version>
 		<!-- Main class -->
 		<start-class>org.kurento.tutorial.helloworld.HelloWorldRecApp</start-class>
+		<java.version>1.8</java.version>
+		<maven.compiler.target>1.8</maven.compiler.target>
+		<maven.compiler.source>1.8</maven.compiler.source>
+		<jdk.version>1.8</jdk.version>
 	</properties>
 
 	<dependencies>
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-web</artifactId>
+			<exclusions>
+				<exclusion>
+					<groupId>org.springframework.boot</groupId>
+					<artifactId>spring-boot-starter-tomcat</artifactId>
+				</exclusion>
+			</exclusions>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-jetty</artifactId>
 		</dependency>
 		<dependency>
 			<groupId>org.springframework</groupId>
@@ -93,9 +111,86 @@
 			<groupId>org.webjars.bower</groupId>
 			<artifactId>ekko-lightbox</artifactId>
 		</dependency>
+
+		<!-- Google auth -->
+		<dependency>
+			<groupId>com.google.auth</groupId>
+			<artifactId>google-auth-library-credentials</artifactId>
+			<version>0.6.0</version>
+		</dependency>
+		<dependency>
+			<groupId>com.google.auth</groupId>
+			<artifactId>google-auth-library-oauth2-http</artifactId>
+			<version>0.6.0</version>
+			<exclusions>
+				<!-- Exclude an old version of guava that is being pulled in by a transitive 
+					dependency of google-api-client -->
+				<exclusion>
+					<groupId>com.google.guava</groupId>
+					<artifactId>guava-jdk5</artifactId>
+				</exclusion>
+			</exclusions>
+		</dependency>
+		<dependency>
+			<groupId>com.google.guava</groupId>
+			<artifactId>guava</artifactId>
+			<version>20.0</version>
+		</dependency>
+		<dependency>
+			<groupId>com.google.truth</groupId>
+			<artifactId>truth</artifactId>
+			<version>0.30</version>
+			<scope>test</scope>
+		</dependency>
+		<!-- gRPC -->
+		<dependency>
+			<groupId>io.grpc</groupId>
+			<artifactId>grpc-auth</artifactId>
+			<version>1.0.2</version>
+		</dependency>
+		<dependency>
+			<groupId>io.grpc</groupId>
+			<artifactId>grpc-netty</artifactId>
+			<version>1.0.2</version>
+		</dependency>
+		<dependency>
+			<groupId>io.grpc</groupId>
+			<artifactId>grpc-protobuf</artifactId>
+			<version>${grpc-protobuf-version}</version>
+		</dependency>
+		<dependency>
+			<groupId>io.grpc</groupId>
+			<artifactId>grpc-stub</artifactId>
+			<version>1.0.2</version>
+		</dependency>
+		<dependency>
+			<!-- - It is recommended to use OpenSSL: Statically Linked Netty - for 
+				transport security. These steps do not use the TLS that - comes with JDK 
+				(Jetty APLN/NPN), which is not - recommended. See - https://github.com/grpc/grpc-java/blob/master/SECURITY.md 
+				- for details. - -->
+			<groupId>io.netty</groupId>
+			<artifactId>netty-tcnative-boringssl-static</artifactId>
+			<version>1.1.33.Fork24</version>
+			<classifier>${tcnative.classifier}</classifier>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-devtools</artifactId>
+		</dependency>
 	</dependencies>
 
 	<build>
+
+		<!-- Protobuf -->
+		<extensions>
+			<extension>
+				<groupId>kr.motd.maven</groupId>
+				<artifactId>os-maven-plugin</artifactId>
+				<version>1.4.1.Final</version>
+			</extension>
+		</extensions>
+		<!-- /Protobuf -->
+
 		<plugins>
 			<plugin>
 				<groupId>org.springframework.boot</groupId>
@@ -118,6 +213,71 @@
 				<configuration>
 					<mainClass>${start-class}</mainClass>
 				</configuration>
+			</plugin>
+
+			<!-- Protobuf -->
+			<plugin>
+				<groupId>org.xolstice.maven.plugins</groupId>
+				<artifactId>protobuf-maven-plugin</artifactId>
+				<version>${xolstice-protobuf-maven-plugin-version}</version>
+				<configuration>
+					<!-- The version of protoc must match protobuf-java. If you don't depend 
+						on protobuf-java directly, you will be transitively depending on the protobuf-java 
+						version that grpc depends on. -->
+					<protocArtifact>com.google.protobuf:protoc:3.0.0:exe:${os.detected.classifier}</protocArtifact>
+					<pluginId>grpc-java</pluginId>
+					<protoSourceRoot>${basedir}/src/main/java/third_party</protoSourceRoot>
+					<pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc-protobuf-version}:exe:${os.detected.classifier}</pluginArtifact>
+				</configuration>
+				<executions>
+					<execution>
+						<goals>
+							<goal>compile</goal>
+							<goal>compile-custom</goal>
+						</goals>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>org.codehaus.mojo</groupId>
+				<artifactId>versions-maven-plugin</artifactId>
+				<version>${codehaus-versions-maven-plugin-version}</version>
+				<executions>
+					<execution>
+						<phase>compile</phase>
+						<goals>
+							<goal>display-dependency-updates</goal>
+						</goals>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<artifactId>maven-compiler-plugin</artifactId>
+				<version>${maven-compiler-plugin-version}</version>
+				<configuration>
+					<source>${jdk.version}</source>
+					<target>${jdk.version}</target>
+					<showWarnings>true</showWarnings>
+					<showDeprecation>false</showDeprecation>
+					<compilerArgument>-Xlint:-options</compilerArgument>
+				</configuration>
+			</plugin>
+			<plugin>
+				<artifactId>maven-assembly-plugin</artifactId>
+				<configuration>
+					<descriptorRefs>
+						<descriptorRef>jar-with-dependencies</descriptorRef>
+					</descriptorRefs>
+				</configuration>
+				<executions>
+					<execution>
+						<id>simple-command</id>
+						<phase>package</phase>
+						<goals>
+							<goal>attached</goal>
+						</goals>
+					</execution>
+				</executions>
 			</plugin>
 		</plugins>
 
@@ -142,46 +302,49 @@
 			<activation>
 				<activeByDefault>true</activeByDefault>
 			</activation>
+			<repositories>
+				<repository>
+					<id>snapshots-repo</id>
+					<url>https://oss.sonatype.org/content/repositories/snapshots</url>
+					<releases>
+						<enabled>false</enabled>
+					</releases>
+					<snapshots>
+						<enabled>true</enabled>
+					</snapshots>
+				</repository>
+			</repositories>
 			<build>
 				<plugins>
-					<plugin>
-						<groupId>org.apache.maven.plugins</groupId>
-						<artifactId>maven-assembly-plugin</artifactId>
-						<configuration>
-							<descriptor>src/assembly/bin.xml</descriptor>
-							<finalName>${project.artifactId}-${project.version}</finalName>
-							<appendAssemblyId>false</appendAssemblyId>
-						</configuration>
-						<executions>
-							<execution>
-								<phase>package</phase>
-								<goals>
-									<goal>single</goal>
-								</goals>
-							</execution>
-						</executions>
-					</plugin>
-					<plugin>
-						<groupId>org.apache.maven.plugins</groupId>
-						<artifactId>maven-antrun-plugin</artifactId>
-						<executions>
-							<execution>
-								<phase>package</phase>
-								<configuration>
-									<tasks>
-										<copy
-											file="${project.build.directory}/target/${project.artifactId}-${project.version}-bin.zip"
-											tofile="${project.build.directory}/target/${project.artifactId}-${project.version}.zip" />
-									</tasks>
-								</configuration>
-							</execution>
-						</executions>
-					</plugin>
+					<!-- <plugin> <groupId>org.apache.maven.plugins</groupId> <artifactId>maven-assembly-plugin</artifactId> 
+						<configuration> <descriptor>src/assembly/bin.xml</descriptor> <finalName>${project.artifactId}-${project.version}</finalName> 
+						<appendAssemblyId>false</appendAssemblyId> </configuration> <executions> 
+						<execution> <phase>package</phase> <goals> <goal>single</goal> </goals> </execution> 
+						</executions> </plugin> <plugin> <groupId>org.apache.maven.plugins</groupId> 
+						<artifactId>maven-antrun-plugin</artifactId> <executions> <execution> <phase>package</phase> 
+						<configuration> <tasks> <copy file="${project.build.directory}/target/${project.artifactId}-${project.version}-bin.zip" 
+						tofile="${project.build.directory}/target/${project.artifactId}-${project.version}.zip" 
+						/> </tasks> </configuration> </execution> </executions> </plugin> -->
 				</plugins>
 			</build>
 		</profile>
-		<profile>
-			<id>no-assembly</id>
-		</profile>
 	</profiles>
+
+	<pluginRepositories>
+		<pluginRepository>
+			<releases>
+				<updatePolicy>never</updatePolicy>
+			</releases>
+			<snapshots>
+				<enabled>false</enabled>
+			</snapshots>
+			<id>central</id>
+			<name>Central Repository</name>
+			<url>https://repo.maven.apache.org/maven2</url>
+		</pluginRepository>
+		<pluginRepository>
+			<id>protoc-plugin</id>
+			<url>https://dl.bintray.com/sergei-ivanov/maven/</url>
+		</pluginRepository>
+	</pluginRepositories>
 </project>
